@@ -139,6 +139,7 @@ impl App {
         // Alpha blend each session's buffer using additive blending
         // Each session contributes with weight = 1/n, summed together
         // This ensures equal contribution and full brightness when all sessions show the same image
+        // TODO: This is pretty slow, as it's completely CPU-based and unoptimized. SIMD might help here.
         for state in self.session_buffers.values() {
             if state.buffer.is_empty() || state.width == 0 || state.height == 0 {
                 continue;
