@@ -1,0 +1,15 @@
+[package]
+name = "ironrdp-cfg"
+version = "0.1.0"
+readme = "README.md"
+description = "IronRDP utilities for ironrdp-cfgstore"
+publish = false
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+doctest = false
+test = false
+
+[dependencies]
+ironrdp-propertyset = { path = "../ironrdp-propertyset", version = "0.1" }

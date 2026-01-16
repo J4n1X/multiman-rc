@@ -1,0 +1,15 @@
+[package]
+name = "ironrdp-rdpfile"
+version = "0.1.0"
+readme = "README.md"
+description = "Parser and writer for .RDP file format"
+publish = false
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+doctest = false
+test = false
+
+[dependencies]
+ironrdp-propertyset = { path = "../ironrdp-propertyset", version = "0.1" }

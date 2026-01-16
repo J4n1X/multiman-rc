@@ -1,0 +1,67 @@
+[package]
+name = "multiman-rc"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["rustls"]
+rustls = ["ironrdp-tls/rustls", "tokio-tungstenite/rustls-tls-native-roots"]
+native-tls = ["ironrdp-tls/native-tls", "tokio-tungstenite/native-tls"]
+
+[dependencies]
+ironrdp = { version = "0.14", features = [
+    "session",
+    "input",
+    "graphics",
+    "dvc",
+    "svc",
+    "rdpdr",
+    "rdpsnd",
+    "cliprdr",
+    "displaycontrol",
+    "connector",
+] }
+ironrdp-core = {version = "0.1", features = ["alloc"] }
+ironrdp-cliprdr-native = { version = "0.5" }
+ironrdp-rdpsnd-native = { version = "0.5" }
+ironrdp-tls = { version = "0.2" }
+ironrdp-dvc-pipe-proxy = "0.3.0"
+ironrdp-tokio = { version = "0.8", features = ["reqwest"] }
+ironrdp-rdcleanpath = { path = "crates/ironrdp-rdcleanpath" }
+ironrdp-propertyset = { path = "crates/ironrdp-propertyset" }
+ironrdp-rdpfile = { path = "crates/ironrdp-rdpfile" }
+ironrdp-cfg = { path = "crates/ironrdp-cfg" }
+
+# Windowing and rendering
+winit = { version = "0.30", features = ["rwh_06"] }
+softbuffer = "0.4"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "cargo"] }
+proc-exit = "2"
+inquire = "0.9"
+
+# Logging
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async, futures
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7" }
+tokio-tungstenite = "0.28"
+transport = { git = "https://github.com/Devolutions/devolutions-gateway", rev = "06e91dfe82751a6502eaf74b6a99663f06f0236d" }
+futures-util = { version = "0.3", features = ["sink"] }
+
+# Utils
+whoami = "1.6"
+anyhow = "1"
+smallvec = "1.15"
+tap = "1"
+semver = "1"
+raw-window-handle = "0.6"
+uuid = { version = "1.19" }
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation"] }

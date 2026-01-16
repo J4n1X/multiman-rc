@@ -1,0 +1,15 @@
+[package]
+name = "ironrdp-rdcleanpath"
+version = "0.2.1"
+readme = "README.md"
+description = "RDCleanPath PDU structure used by IronRDP web client and Devolutions Gateway"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+doctest = false
+test = false
+
+[dependencies]
+der = { version = "0.7", features = ["alloc", "derive"] }
+
