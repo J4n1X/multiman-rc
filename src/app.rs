@@ -2,13 +2,15 @@
 
 use core::num::NonZeroU32;
 use core::time::Duration;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context as _;
+use ironrdp::graphics::pointer::DecodedPointer;
 use raw_window_handle::{DisplayHandle, HasDisplayHandle as _};
 use tokio::sync::mpsc;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, PhysicalSize};
 use winit::event::{self, WindowEvent};
@@ -16,15 +18,40 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::platform::scancode::PhysicalKeyExtScancode as _;
 use winit::window::{CursorIcon, CustomCursor, Window, WindowAttributes};
 
-use crate::rdp::{RdpInputEvent, RdpOutputEvent};
+use crate::rdp::{RdpInputEvent, RdpOutputEvent, SessionId};
 
 type WindowSurface = (Arc<Window>, softbuffer::Surface<DisplayHandle<'static>, Arc<Window>>);
+
+/// Per-session state for blended rendering
+struct SessionState {
+    buffer: Vec<u32>,
+    width: u16,
+    height: u16,
+    pointer: Option<Arc<DecodedPointer>>,
+    pointer_visible: bool,
+}
+
+impl SessionState {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            width: 0,
+            height: 0,
+            pointer: None,
+            pointer_visible: true,
+        }
+    }
+}
 
 pub struct App {
     input_event_sender: mpsc::UnboundedSender<RdpInputEvent>,
     context: softbuffer::Context<DisplayHandle<'static>>,
     window: Option<WindowSurface>,
-    buffer: Vec<u32>,
+    /// Per-session frame buffers for alpha blending
+    session_buffers: HashMap<SessionId, SessionState>,
+    /// Composited buffer for display
+    composited_buffer: Vec<u32>,
+    /// Size of the composited buffer (max of all sessions)
     buffer_size: (u16, u16),
     input_database: ironrdp::input::Database,
     last_size: Option<PhysicalSize<u32>>,
@@ -51,7 +78,8 @@ impl App {
             input_event_sender: input_event_sender.clone(),
             context,
             window: None,
-            buffer: Vec::new(),
+            session_buffers: HashMap::new(),
+            composited_buffer: Vec::new(),
             buffer_size: (0, 0),
             input_database,
             last_size: None,
@@ -84,16 +112,192 @@ impl App {
         });
     }
 
+    /// Composite all session buffers using alpha blending (each session has alpha = 1/n)
+    fn composite_buffers(&mut self) {
+        let num_sessions = self.session_buffers.len();
+        if num_sessions == 0 {
+            self.composited_buffer.clear();
+            return;
+        }
+
+        // Find the maximum dimensions across all sessions
+        let (max_width, max_height) = self.session_buffers.values().fold((0u16, 0u16), |(w, h), state| {
+            (w.max(state.width), h.max(state.height))
+        });
+
+        if max_width == 0 || max_height == 0 {
+            return;
+        }
+
+        self.buffer_size = (max_width, max_height);
+        let total_pixels = (max_width as usize) * (max_height as usize);
+
+        // Initialize composited buffer with black (transparent)
+        self.composited_buffer.clear();
+        self.composited_buffer.resize(total_pixels, 0);
+
+        // Alpha blend each session's buffer using additive blending
+        // Each session contributes with weight = 1/n, summed together
+        // This ensures equal contribution and full brightness when all sessions show the same image
+        for state in self.session_buffers.values() {
+            if state.buffer.is_empty() || state.width == 0 || state.height == 0 {
+                continue;
+            }
+
+            for y in 0..(state.height as usize).min(max_height as usize) {
+                for x in 0..(state.width as usize).min(max_width as usize) {
+                    let src_idx = y * (state.width as usize) + x;
+                    let dst_idx = y * (max_width as usize) + x;
+
+                    if src_idx < state.buffer.len() && dst_idx < self.composited_buffer.len() {
+                        let src_pixel = state.buffer[src_idx];
+                        let dst_pixel = self.composited_buffer[dst_idx];
+
+                        // Extract RGB components (format: 0x00RRGGBB in big-endian)
+                        let src_r = (src_pixel >> 16) & 0xFF;
+                        let src_g = (src_pixel >> 8) & 0xFF;
+                        let src_b = src_pixel & 0xFF;
+
+                        let dst_r = (dst_pixel >> 16) & 0xFF;
+                        let dst_g = (dst_pixel >> 8) & 0xFF;
+                        let dst_b = dst_pixel & 0xFF;
+
+                        // Additive blending: add src/n to the accumulator
+                        // Each session contributes 1/n of its color value
+                        let r = (dst_r + src_r / num_sessions as u32).min(255);
+                        let g = (dst_g + src_g / num_sessions as u32).min(255);
+                        let b = (dst_b + src_b / num_sessions as u32).min(255);
+
+                        self.composited_buffer[dst_idx] = (r << 16) | (g << 8) | b;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Create a combined cursor from all session pointers
+    fn update_combined_cursor(&mut self, event_loop: &ActiveEventLoop) {
+        let Some((window, _)) = self.window.as_mut() else {
+            return;
+        };
+
+        // Collect all visible pointers
+        let visible_pointers: Vec<&Arc<DecodedPointer>> = self
+            .session_buffers
+            .values()
+            .filter(|s| s.pointer_visible && s.pointer.is_some())
+            .filter_map(|s| s.pointer.as_ref())
+            .collect();
+
+        if visible_pointers.is_empty() {
+            window.set_cursor(CursorIcon::default());
+            window.set_cursor_visible(true);
+            return;
+        }
+
+        // If only one pointer, use it directly
+        if visible_pointers.len() == 1 {
+            let pointer = visible_pointers[0];
+            match CustomCursor::from_rgba(
+                pointer.bitmap_data.clone(),
+                pointer.width,
+                pointer.height,
+                pointer.hotspot_x,
+                pointer.hotspot_y,
+            ) {
+                Ok(cursor) => window.set_cursor(event_loop.create_custom_cursor(cursor)),
+                Err(error) => error!(?error, "Failed to set cursor bitmap"),
+            }
+            window.set_cursor_visible(true);
+            return;
+        }
+
+        // Combine multiple pointers by alpha blending them
+        // Find max dimensions
+        let max_width = visible_pointers.iter().map(|p| p.width).max().unwrap_or(0);
+        let max_height = visible_pointers.iter().map(|p| p.height).max().unwrap_or(0);
+
+        if max_width == 0 || max_height == 0 {
+            window.set_cursor(CursorIcon::default());
+            return;
+        }
+
+        let total_pixels = (max_width * max_height) as usize;
+        let mut combined_rgba = vec![0u8; total_pixels * 4];
+
+        let alpha_per_pointer = 255 / visible_pointers.len() as u32;
+
+        for pointer in &visible_pointers {
+            let pw = pointer.width as usize;
+            let ph = pointer.height as usize;
+
+            for y in 0..ph.min(max_height as usize) {
+                for x in 0..pw.min(max_width as usize) {
+                    let src_idx = (y * pw + x) * 4;
+                    let dst_idx = (y * max_width as usize + x) * 4;
+
+                    if src_idx + 3 < pointer.bitmap_data.len() && dst_idx + 3 < combined_rgba.len() {
+                        let src_r = pointer.bitmap_data[src_idx] as u32;
+                        let src_g = pointer.bitmap_data[src_idx + 1] as u32;
+                        let src_b = pointer.bitmap_data[src_idx + 2] as u32;
+                        let src_a = pointer.bitmap_data[src_idx + 3] as u32;
+
+                        let dst_r = combined_rgba[dst_idx] as u32;
+                        let dst_g = combined_rgba[dst_idx + 1] as u32;
+                        let dst_b = combined_rgba[dst_idx + 2] as u32;
+                        let dst_a = combined_rgba[dst_idx + 3] as u32;
+
+                        // Blend with session alpha
+                        let eff_alpha = (src_a * alpha_per_pointer) / 255;
+                        let inv_alpha = 255 - eff_alpha;
+
+                        combined_rgba[dst_idx] = ((dst_r * inv_alpha + src_r * eff_alpha) / 255) as u8;
+                        combined_rgba[dst_idx + 1] = ((dst_g * inv_alpha + src_g * eff_alpha) / 255) as u8;
+                        combined_rgba[dst_idx + 2] = ((dst_b * inv_alpha + src_b * eff_alpha) / 255) as u8;
+                        combined_rgba[dst_idx + 3] = (dst_a + eff_alpha).min(255) as u8;
+                    }
+                }
+            }
+        }
+
+        // Use the first pointer's hotspot as the combined hotspot
+        let hotspot_x = visible_pointers[0].hotspot_x;
+        let hotspot_y = visible_pointers[0].hotspot_y;
+
+        match CustomCursor::from_rgba(combined_rgba, max_width as u16, max_height as u16, hotspot_x, hotspot_y) {
+            Ok(cursor) => window.set_cursor(event_loop.create_custom_cursor(cursor)),
+            Err(error) => {
+                error!(?error, "Failed to create combined cursor");
+                window.set_cursor(CursorIcon::default());
+            }
+        }
+        window.set_cursor_visible(true);
+    }
+
     fn draw(&mut self) {
-        if self.buffer.is_empty() {
+        if self.composited_buffer.is_empty() {
             return;
         }
         let Some((_, surface)) = self.window.as_mut() else {
             return;
         };
         let mut sb_buffer = surface.buffer_mut().expect("surface buffer");
-        sb_buffer.copy_from_slice(self.buffer.as_slice());
+        sb_buffer.copy_from_slice(self.composited_buffer.as_slice());
         sb_buffer.present().expect("buffer present");
+    }
+
+    fn remove_session(&mut self, session_id: SessionId) {
+        self.session_buffers.remove(&session_id);
+        info!(?session_id, remaining = self.session_buffers.len(), "Session removed");
+        
+        // Recomposite with remaining sessions
+        if !self.session_buffers.is_empty() {
+            self.composite_buffers();
+        }
+    }
+
+    fn has_active_sessions(&self) -> bool {
+        !self.session_buffers.is_empty()
     }
 }
 
@@ -338,67 +542,108 @@ impl ApplicationHandler<RdpOutputEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: RdpOutputEvent) {
-        let Some((window, surface)) = self.window.as_mut() else {
-            return;
-        };
         match event {
-            RdpOutputEvent::Image { buffer, width, height } => {
-                trace!(width = ?width, height = ?height, "Received image with size");
-                trace!(window_physical_size = ?window.inner_size(), "Drawing image to the window with size");
-                self.buffer_size = (width.get(), height.get());
-                self.buffer = buffer;
-                surface
-                    .resize(NonZeroU32::from(width), NonZeroU32::from(height))
-                    .expect("surface resize");
+            RdpOutputEvent::Image { session_id, buffer, width, height } => {
+                trace!(width = ?width, height = ?height, ?session_id, "Received image with size");
+                
+                // Update this session's buffer
+                let state = self.session_buffers.entry(session_id).or_insert_with(SessionState::new);
+                state.buffer = buffer;
+                state.width = width.get();
+                state.height = height.get();
 
-                window.request_redraw();
+                // Recomposite all buffers
+                self.composite_buffers();
+
+                // Now access window for resize and redraw
+                if let Some((window, surface)) = self.window.as_mut() {
+                    trace!(window_physical_size = ?window.inner_size(), "Drawing composited image to the window");
+                    
+                    if self.buffer_size.0 > 0 && self.buffer_size.1 > 0 {
+                        let w = NonZeroU32::new(self.buffer_size.0 as u32).unwrap();
+                        let h = NonZeroU32::new(self.buffer_size.1 as u32).unwrap();
+                        surface.resize(w, h).expect("surface resize");
+                    }
+
+                    window.request_redraw();
+                }
             }
-            RdpOutputEvent::ConnectionFailure(error) => {
-                error!(?error);
-                eprintln!("Connection error: {}", error.report());
-                // TODO set proc_exit::sysexits::PROTOCOL_ERR.as_raw());
-                event_loop.exit();
+            RdpOutputEvent::ConnectionFailure { session_id, error } => {
+                error!(?error, ?session_id, "Connection failure");
+                eprintln!("Connection error for session {:?}: {}", session_id, error.report());
+                
+                // Remove this session
+                self.remove_session(session_id);
+                
+                // Only exit if no sessions remain
+                if !self.has_active_sessions() {
+                    event_loop.exit();
+                }
             }
-            RdpOutputEvent::Terminated(result) => {
-                let _exit_code = match result {
+            RdpOutputEvent::SessionTerminated { session_id, result } => {
+                match &result {
                     Ok(reason) => {
-                        println!("Terminated gracefully: {reason}");
-                        proc_exit::sysexits::OK
+                        info!(?session_id, ?reason, "Session terminated gracefully");
                     }
                     Err(error) => {
-                        error!(?error);
-                        eprintln!("Active session error: {}", error.report());
-                        proc_exit::sysexits::PROTOCOL_ERR
+                        error!(?session_id, ?error, "Session terminated with error");
+                        eprintln!("Session {:?} error: {}", session_id, error.report());
                     }
-                };
-                // TODO set exit_code.as_raw());
+                }
+                
+                // Remove this session
+                self.remove_session(session_id);
+                
+                // Update cursor after session removal
+                self.update_combined_cursor(event_loop);
+                
+                // Only exit if no sessions remain
+                if !self.has_active_sessions() {
+                    println!("All sessions ended");
+                    event_loop.exit();
+                } else {
+                    // Recomposite and redraw with remaining sessions
+                    self.composite_buffers();
+                    if let Some((window, _)) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+            }
+            RdpOutputEvent::AllSessionsEnded => {
+                info!("All sessions have ended");
                 event_loop.exit();
             }
-            RdpOutputEvent::PointerHidden => {
-                window.set_cursor_visible(false);
+            RdpOutputEvent::PointerHidden { session_id } => {
+                if let Some(state) = self.session_buffers.get_mut(&session_id) {
+                    state.pointer_visible = false;
+                }
+                self.update_combined_cursor(event_loop);
             }
-            RdpOutputEvent::PointerDefault => {
-                window.set_cursor(CursorIcon::default());
-                window.set_cursor_visible(true);
+            RdpOutputEvent::PointerDefault { session_id } => {
+                if let Some(state) = self.session_buffers.get_mut(&session_id) {
+                    state.pointer = None;
+                    state.pointer_visible = true;
+                }
+                self.update_combined_cursor(event_loop);
             }
-            RdpOutputEvent::PointerPosition { x, y } => {
-                if let Err(error) = window.set_cursor_position(LogicalPosition::new(x, y)) {
-                    error!(?error, "Failed to set cursor position");
+            RdpOutputEvent::PointerPosition { session_id: _, x, y } => {
+                // Position is shared across all sessions, just set it once
+                if let Some((window, _)) = self.window.as_ref() {
+                    if let Err(error) = window.set_cursor_position(LogicalPosition::new(x, y)) {
+                        error!(?error, "Failed to set cursor position");
+                    }
                 }
             }
-            RdpOutputEvent::PointerBitmap(pointer) => {
-                debug!(width = ?pointer.width, height = ?pointer.height, "Received pointer bitmap");
-                match CustomCursor::from_rgba(
-                    pointer.bitmap_data.clone(),
-                    pointer.width,
-                    pointer.height,
-                    pointer.hotspot_x,
-                    pointer.hotspot_y,
-                ) {
-                    Ok(cursor) => window.set_cursor(event_loop.create_custom_cursor(cursor)),
-                    Err(error) => error!(?error, "Failed to set cursor bitmap"),
-                }
-                window.set_cursor_visible(true);
+            RdpOutputEvent::PointerBitmap { session_id, pointer } => {
+                debug!(?session_id, width = ?pointer.width, height = ?pointer.height, "Received pointer bitmap");
+                
+                // Store pointer for this session
+                let state = self.session_buffers.entry(session_id).or_insert_with(SessionState::new);
+                state.pointer = Some(pointer);
+                state.pointer_visible = true;
+                
+                // Update combined cursor
+                self.update_combined_cursor(event_loop);
             }
         }
     }

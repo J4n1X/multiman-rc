@@ -19,7 +19,8 @@ const DEFAULT_HEIGHT: u16 = 1080;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub log_file: Option<String>,
-    pub destination: Destination,
+    /// Multiple destinations for multi-session mode (blended display)
+    pub destinations: Vec<Destination>,
     pub connector: connector::Config,
     pub clipboard_type: ClipboardType,
     pub rdcleanpath: Option<RDCleanPathConfig>,
@@ -30,6 +31,13 @@ pub struct Config {
     /// server, which will be used for proxying DVC messages to/from user-defined DVC logic
     /// implemented as named pipe clients (either in the same process or in a different process).
     pub dvc_pipe_proxies: Vec<DvcProxyInfo>,
+}
+
+impl Config {
+    /// Get the first destination (for compatibility with single-session code paths)
+    pub fn destination(&self) -> &Destination {
+        self.destinations.first().expect("at least one destination required")
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -189,8 +197,10 @@ struct Args {
     #[clap(long, value_parser)]
     gw_pass: Option<String>,
 
-    /// An address on which the client will connect.
-    destination: Option<Destination>,
+    /// Addresses on which the client will connect (comma-separated for multiple hosts).
+    /// Multiple hosts will be opened in blended multi-session mode.
+    #[clap(value_delimiter = ',')]
+    destinations: Vec<Destination>,
 
     /// Path to a .rdp file to read the configuration from.
     #[clap(long)]
@@ -301,22 +311,36 @@ impl Config {
 
         let args = Args::parse();
 
-        let mut properties = ironrdp_propertyset::PropertySet::new();
+        let properties = ironrdp_propertyset::PropertySet::new();
 
-        let destination = if let Some(destination) = args.destination {
-            destination
+        // Handle multiple destinations for blended multi-session mode
+        let destinations = if !args.destinations.is_empty() {
+            args.destinations
         } else if let Some(destination) = properties.full_address() {
-            if let Some(port) = properties.server_port() {
+            let dest = if let Some(port) = properties.server_port() {
                 format!("{destination}:{port}").parse()
             } else {
                 destination.parse()
             }
-            .context("invalid destination")?
+            .context("invalid destination")?;
+            vec![dest]
         } else {
-            inquire::Text::new("Server address:")
+            // Prompt for addresses (comma-separated for multi-session)
+            let input = inquire::Text::new("Server address(es) (comma-separated for multi-session):")
                 .prompt()
-                .context("Address prompt")?
-                .pipe(Destination::new)?
+                .context("Address prompt")?;
+            
+            let mut dests = Vec::new();
+            for addr in input.split(',') {
+                let addr = addr.trim();
+                if !addr.is_empty() {
+                    dests.push(Destination::new(addr)?);
+                }
+            }
+            if dests.is_empty() {
+                anyhow::bail!("At least one destination address is required");
+            }
+            dests
         };
 
         let username = if let Some(username) = args.username {
@@ -423,7 +447,7 @@ impl Config {
 
         Ok(Self {
             log_file: args.log_file,
-            destination,
+            destinations,
             connector,
             clipboard_type,
             rdcleanpath,
