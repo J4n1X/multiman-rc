@@ -27,6 +27,7 @@ struct SessionState {
     buffer: Vec<u32>,
     width: u16,
     height: u16,
+    // TODO: Do we really need pointers for every session? Look if it's usable with just one.
     pointer: Option<Arc<DecodedPointer>>,
     pointer_visible: bool,
 }
@@ -232,6 +233,7 @@ impl App {
             let pw = pointer.width as usize;
             let ph = pointer.height as usize;
 
+            // TODO: Here as well, this is pretty slow. Optimize with SIMD? (Or get rid of multiple cursors support?)
             for y in 0..ph.min(max_height as usize) {
                 for x in 0..pw.min(max_width as usize) {
                     let src_idx = (y * pw + x) * 4;
